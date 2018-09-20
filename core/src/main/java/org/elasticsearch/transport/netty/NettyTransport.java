@@ -764,30 +764,37 @@ public class NettyTransport extends AbstractLifecycleComponent<Transport> implem
     }
 
     protected void exceptionCaught(ChannelHandlerContext ctx, ExceptionEvent e) throws Exception {
+        exceptionCaught(ctx.getChannel(), e.getCause());
+    }
+
+    protected void exceptionCaught(Channel channel, Throwable e) throws Exception {
         if (!lifecycle.started()) {
             // ignore
             return;
         }
-        if (isCloseConnectionException(e.getCause())) {
-            logger.trace("close connection exception caught on transport layer [{}], disconnecting from relevant node", e.getCause(), ctx.getChannel());
+        if (e.getCause() != null) {
+            e = e.getCause();
+        }
+        if (isCloseConnectionException(e)) {
+            logger.error("close connection exception caught on transport layer [{}], disconnecting from relevant node", e, channel);
             // close the channel, which will cause a node to be disconnected if relevant
-            ctx.getChannel().close();
-            disconnectFromNodeChannel(ctx.getChannel(), e.getCause());
-        } else if (isConnectException(e.getCause())) {
-            logger.trace("connect exception caught on transport layer [{}]", e.getCause(), ctx.getChannel());
+            channel.close();
+            disconnectFromNodeChannel(channel, e);
+        } else if (isConnectException(e)) {
+            logger.error("connect exception caught on transport layer [{}]", e, channel);
             // close the channel as safe measure, which will cause a node to be disconnected if relevant
-            ctx.getChannel().close();
-            disconnectFromNodeChannel(ctx.getChannel(), e.getCause());
+            channel.close();
+            disconnectFromNodeChannel(channel, e);
         } else if (e.getCause() instanceof CancelledKeyException) {
-            logger.trace("cancelled key exception caught on transport layer [{}], disconnecting from relevant node", e.getCause(), ctx.getChannel());
+            logger.error("cancelled key exception caught on transport layer [{}], disconnecting from relevant node", e, channel);
             // close the channel as safe measure, which will cause a node to be disconnected if relevant
-            ctx.getChannel().close();
-            disconnectFromNodeChannel(ctx.getChannel(), e.getCause());
+            channel.close();
+            disconnectFromNodeChannel(channel, e);
         } else if (e.getCause() instanceof SizeHeaderFrameDecoder.HttpOnTransportException) {
             // in case we are able to return data, serialize the exception content and sent it back to the client
-            if (ctx.getChannel().isOpen()) {
-                ChannelBuffer buffer = ChannelBuffers.wrappedBuffer(e.getCause().getMessage().getBytes(Charsets.UTF_8));
-                ChannelFuture channelFuture = ctx.getChannel().write(buffer);
+            if (channel.isOpen()) {
+                ChannelBuffer buffer = ChannelBuffers.wrappedBuffer(e.getMessage().getBytes(Charsets.UTF_8));
+                ChannelFuture channelFuture = channel.write(buffer);
                 channelFuture.addListener(new ChannelFutureListener() {
                     @Override
                     public void operationComplete(ChannelFuture future) throws Exception {
@@ -796,10 +803,10 @@ public class NettyTransport extends AbstractLifecycleComponent<Transport> implem
                 });
             }
         } else {
-            logger.warn("exception caught on transport layer [{}], closing connection", e.getCause(), ctx.getChannel());
+            logger.error("exception caught on transport layer [{}], closing connection", e, channel);
             // close the channel, which will cause a node to be disconnected if relevant
-            ctx.getChannel().close();
-            disconnectFromNodeChannel(ctx.getChannel(), e.getCause());
+            channel.close();
+            disconnectFromNodeChannel(channel, e);
         }
     }
 
@@ -827,7 +834,7 @@ public class NettyTransport extends AbstractLifecycleComponent<Transport> implem
     @Override
     public void sendRequest(final DiscoveryNode node, final long requestId, final String action, final TransportRequest request, TransportRequestOptions options) throws IOException, TransportException {
 
-        Channel targetChannel = nodeChannel(node, options);
+        final Channel targetChannel = nodeChannel(node, options);
 
         if (compress) {
             options = TransportRequestOptions.builder(options).withCompress(true).build();
@@ -882,10 +889,19 @@ public class NettyTransport extends AbstractLifecycleComponent<Transport> implem
             future.addListener(listener);
             addedReleaseListener = true;
             final TransportRequestOptions finalOptions = options;
+            logger.trace("Running request with changes for PDS-74470");
             ChannelFutureListener channelFutureListener = new ChannelFutureListener() {
                 @Override
                 public void operationComplete(ChannelFuture future) throws Exception {
-                    transportServiceAdapter.onRequestSent(node, requestId, action, request, finalOptions);
+                    if (future.isSuccess()) {
+                        transportServiceAdapter.onRequestSent(node, requestId, action, request, finalOptions);
+                    } else {
+                        Throwable cause = future.getCause();
+                        logger.warn("transport request was not successful see cause for more information", cause);
+                        if (cause instanceof Exception) {
+                            exceptionCaught(targetChannel, cause);
+                        }
+                    }
                 }
             };
             future.addListener(channelFutureListener);
